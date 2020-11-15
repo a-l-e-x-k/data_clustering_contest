@@ -5,21 +5,25 @@
 import argparse
 import itertools
 import json
+import logging
 import multiprocessing
 import os
 import pickle
 import re
+import socket
 import string
+import sys
 import threading
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
-from enum import Enum
+from enum import Enum, auto
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
 import fasttext
+import jsonlines
 import numpy as np
 import scipy
 import sentencepiece as spm
@@ -58,8 +62,8 @@ BLACKLIST_OVERRIDE_THRESHOLD = 0.8
 # Cosine similarity threshold for assigning an article to a cluster.
 CLUSTER_ASSIGNMENT_THRESHOLD = 0.4
 
-# Max number of characters to read from a file.
-MAX_CHARS = 3000
+# Max number of characters to read for an article.
+MAX_CHARS = 2500
 
 # Max number of characters to use for a title.
 MAX_CHARS_TITLE = 300
@@ -83,10 +87,19 @@ MIN_TITLE_TOKEN_CNT = 5
 MIN_WORD_LEN = 2
 
 # Max number of files to use.
-MAX_FILE_CNT = 5000000
+MAX_FILE_CNT = 10000000
+
+# Max number of files to use.
+MAX_INDEX_SIZE = 100000000
 
 # Number of processes to use for parallel file processing.
 NUM_PROCESSES = 16
+
+# Max number of article threads to return in a server mode.
+MAX_THREADS_CNT = 1000
+
+# Number of HTTP server threads.
+HTTP_SERVER_THREAD_CNT = 100
 
 # Classification categories.
 ID_TO_CATEGORY = {0:'society', 1:'economy', 2:'technology', 3:'sports', 4:'entertainment', 5:'science', 6:'other'}
@@ -160,14 +173,14 @@ TITLE_PATTERNS_OTHER_RU = {'W W W ##.##.##', 'W W W W: W, ## W', 'W W W W: W, # 
 TOKEN_CATEGORIES = {'accidents':'society','crime':'society','geopolitics':'society','incident':'society','incidents':'society','politics':'society','politika':'society','business':'economy','economy':'economy','economic':'economy','economics':'economy','ekonomika':'economy','finance':'economy','markets':'economy','money':'economy','stocks':'economy','baseball':'sports','basketball':'sports','cricket':'sports','football':'sports','football-news':'sports','futbol':'sports','rugby':'sports','soccer':'sports','sport':'sports','sports':'sports','tennis':'sports','bollywood':'entertainment','entertainment':'entertainment','movies':'entertainment','showbiz':'entertainment','health':'science','science':'science','technology':'technology'}
 TOKEN_CATEGORIES_SET = set(TOKEN_CATEGORIES.keys())
 
-# Min time for time bucket calculation.
-MIN_BUCKET_DATE = datetime(2019, 11, 1)
+# Min time for time bucket calculation (datetime(2019, 11, 1)).
+MIN_BUCKET_DATE = 1572570000
 
 # Possible server states.
 class ServerState(Enum):
-    OFF = 0
-    LOADING = 1
-    READY = 2
+    OFF = auto()
+    LOADING = auto()
+    READY = auto()
 
 # Permitted CLI commands.
 CLI_MODE_COMMANDS = {'languages', 'news', 'categories', 'threads', 'top'}
@@ -194,8 +207,8 @@ all_articles = set()
 # Mapping from article file name to article info.
 file_name_to_article = {}
 
-# Publication time of latest article.
-max_publication_time = datetime(2000, 1, 1)
+# Publication time of latest article (datetime(2000, 1, 1)).
+max_publication_time = 946688400
 
 # Mapping from (time bucket ID, lang) to its info:
 # {'start_time', 'end_time', 'article_ids', 'mx', 'clusters', 'reverse_ix'}.
@@ -203,22 +216,43 @@ time_buckets = {}
 
 # Times of last TTL cleanup and index disk dump.
 last_ttl_cleanup_time = time.time()
-last_save_time = time.time()
+
+# Lock for multi-threading processing of server requests.
+lock = threading.RLock()
+
+# Logging setup.
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+LOGGING_FORMAT = '%(asctime)-15s: %(message)s'
+formatter = logging.Formatter(LOGGING_FORMAT)
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+file_handler = logging.FileHandler('tgnews.log')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Index I/O.
+def create_json_writer(file_path, mode='a', compact=True, sort_keys=True, flush=True):
+    """Create a `jsonlines` writer."""
+    return jsonlines.Writer(open(file_path, mode), compact=compact, sort_keys=sort_keys, flush=flush)
+
+ARTICLE_UPDATES_PATH = 'article_updates.jsonl'
+CLUSTERS_PATH = 'clusters.jsonl'
+ARTICLE_UPDATES_FILE = create_json_writer(ARTICLE_UPDATES_PATH)
+
+# Article info fields which are saved to disk.
+SAVED_ARTICLE_FIELDS = {'file_name', 'publication_time', 'time_bucket_id', 'ttl', 'language', 'domain', 'domain_pr', 'category', 'original_title', 'index_row_id', 'cluster_id'}
 
 
-def get_save_delay():
-    """Get number of seconds between index writes to disk."""
-    index_size = len(file_name_to_article)
-    delay_sec = 30
-    if index_size > 300000:
-        delay_sec = 300
-    elif index_size > 200000:
-        delay_sec = 180    
-    elif index_size > 100000:
-        delay_sec = 120
-    elif index_size > 50000:
-        delay_sec = 60
-    return delay_sec
+# Article update event types.
+class ArticleUpdate(Enum):
+    ADD = auto()
+    DELETE = auto()
+    IGNORE = auto()
 
 
 def lowercase_except_acronyms(input_str):
@@ -252,7 +286,7 @@ def clean_string(input_str):
 def get_hour_bucket_id(input_datetime, start_time=MIN_BUCKET_DATE, bucket_size_sec=57600):
     """Get hour bucket ID since the beginning of time."""
     input_datetime = max(start_time, input_datetime)
-    return (input_datetime - start_time).total_seconds() // bucket_size_sec
+    return int((input_datetime - start_time) // bucket_size_sec)
 
 
 def replace_digits(input_str):
@@ -305,7 +339,7 @@ def process_html(html_text, file_name):
             language = LANG_BG
 
     publish_time_search_res = PUBLICATION_TIME_REGEX.search(html_text)
-    publication_time = datetime.strptime(publish_time_search_res.group(1)[:-8], '%Y-%m-%dT%H:%M:%S') \
+    publication_time = int(datetime.strptime(publish_time_search_res.group(1)[:-8], '%Y-%m-%dT%H:%M:%S').timestamp()) \
                        if publish_time_search_res else MIN_BUCKET_DATE
 
     return {
@@ -515,24 +549,29 @@ def get_classify_news_response(article_info):
             for c, articles in result.items()]
 
 
+def create_time_bucket(bucket_id):
+    """Create a time bucket with pre-filled values."""
+    return {
+        'id': bucket_id,
+        'max_time': MIN_BUCKET_DATE,
+        'mx': np.empty(0),
+        'clusters': {},  # Map from article ID to its cluster.
+        'inverted_ix': scipy.sparse.lil_matrix(
+            (len(vectorizer_en.vocabulary_), MAX_INDEX_SIZE), dtype=np.int32)
+    }
+
+
 def get_time_bucket_info(time_bucket_id, lang_code):
     """Get info about articles and clusters in a given time bucket."""
     tb_key = (time_bucket_id, lang_code)
     if tb_key not in time_buckets:
-        time_buckets[tb_key] = {
-            'id': time_bucket_id,
-            'max_time': MIN_BUCKET_DATE,
-            'mx': np.empty(0),
-            'clusters': {},  # Map from article ID to its cluster.
-            'inverted_ix': scipy.sparse.lil_matrix(
-                (len(vectorizer_en.vocabulary_), 5000000), dtype=np.int32)
-        }
+        time_buckets[tb_key] = create_time_bucket(time_bucket_id)
     return time_buckets[tb_key]
 
 
 def index_article(file_name, article_info, vectorizer):
     """Add article to the index."""
-    global last_save_time, last_ttl_cleanup_time, max_publication_time
+    global last_ttl_cleanup_time, max_publication_time
 
     article_lang = article_info['language']
     file_name_to_article[file_name] = article_info
@@ -548,7 +587,7 @@ def index_article(file_name, article_info, vectorizer):
     # Transform article title.
     title = article_info['title_with_digits']
     title_tfidf = vectorizer.transform([title])
-    term_ix = [x for x in title_tfidf.indices if vectorizer.idf_[x] < 3.5]
+    term_ix = [int(x) for x in title_tfidf.indices if vectorizer.idf_[x] > 3.5]
 
     # Boost importance of certain tokens (such as geo).
     matched_tokens = set(title.split(' ')) & boosted_tokens
@@ -603,7 +642,7 @@ def index_article(file_name, article_info, vectorizer):
         article_info['publication_time'],
         target_bucket['max_time'])
 
-    # Attach article to existing cluster.
+    # Attach article to the existing cluster.
     if max_sim > CLUSTER_ASSIGNMENT_THRESHOLD:
         current_cluster = target_bucket['clusters'][cluster_id]
         
@@ -616,7 +655,6 @@ def index_article(file_name, article_info, vectorizer):
         article_file_names += (file_name,)
         article_times += (article_info['publication_time'],)
         article_categories += (article_info['category'],)
-
         current_cluster['category'] = Counter(
             current_cluster['article_categories']).most_common(1)[0][0]
 
@@ -633,6 +671,7 @@ def index_article(file_name, article_info, vectorizer):
         current_cluster['max_time'] = max(article_info['publication_time'], current_cluster['max_time'])
 
         target_bucket['clusters'][row_id] = current_cluster
+        article_info['cluster_id'] = current_cluster['id']
     # Create a new cluster with current article in it.
     else:
         current_cluster = {}
@@ -644,20 +683,29 @@ def index_article(file_name, article_info, vectorizer):
         current_cluster['max_time'] = article_info['publication_time']
         current_cluster['category'] = article_info['category']
         target_bucket['clusters'][row_id] = current_cluster
+        article_info['cluster_id'] = row_id
 
     current_time = time.time()
-    if current_time - last_save_time >= get_save_delay():
-        save_to_disk()
-        last_save_time = current_time
     if current_time - last_ttl_cleanup_time >= TTL_CLEANUP_FREQUENCY:
         run_ttl_cleanup()
         last_ttl_cleanup_time = current_time
+
+    # Save updates to disk.
+    ARTICLE_UPDATES_FILE.write({
+        'eventType': ArticleUpdate.ADD.name,
+        'file_name': file_name,
+        'article_info': {k:v for k, v in article_info.items() if k in SAVED_ARTICLE_FIELDS},
+        'time_bucket_id': target_bucket['id'],
+        'term_ix': term_ix,
+        'tfidf_data': title_tfidf.data.tolist(),
+        'tfidf_indices': title_tfidf.indices.tolist(),
+    })
 
 
 def get_index_threads(period, lang_code, category):
     """Extract article threads from the index."""
     threads = []
-    min_time = max_publication_time - timedelta(seconds=period)
+    min_time = max_publication_time - period
     for (bucket_id, bucket_lang_code), info in time_buckets.items():
         if info['max_time'] < min_time:
             continue
@@ -669,12 +717,15 @@ def get_index_threads(period, lang_code, category):
         for cluster_id, cluster in info['clusters'].items():
             if category != 'any' and cluster['category'] != category:
                 continue
+
             if cluster['max_time'] < min_time:
                 continue
+
             if cluster['id'] in processed_clusters:
                 continue
 
             file_names = cluster['article_file_names']
+
             title = file_name_to_article[file_names[0]]['original_title']
 
             unique_pr = {(file_name_to_article[f_name]['domain_pr'],
@@ -694,7 +745,10 @@ def get_index_threads(period, lang_code, category):
     # Sort threads by combined PageRank of articles and article count.
     threads = sorted(threads, key=lambda x: (x['domain_cnt'] * x['total_pr'], len(x['articles'])), reverse=True)
 
-    return {'threads': [{f: t[f] for f in THREAD_FIELDS if f in t} for t in threads]}
+    # Return only `MAX_THREADS_CNT` threads.
+    threads = threads[:MAX_THREADS_CNT]
+
+    return {'threads': [{f:t[f] for f in THREAD_FIELDS if f in t} for t in threads]}
 
 
 def delete_csr_row(mx, i):
@@ -720,8 +774,7 @@ def delete_article(file_name):
     This has no impact on the clustering output
     as deletes are performed on the main (CSR) matrix.
     """
-    global last_save_time, max_publication_time
-
+    global max_publication_time
     all_articles.remove(file_name)
 
     # Delete EN/RU news article from the index.
@@ -751,17 +804,17 @@ def delete_article(file_name):
 
         file_name_to_article.pop(file_name)
 
-    current_time = time.time()
-    if current_time - last_save_time >= get_save_delay():
-        save_to_disk()
-        last_save_time = current_time
+    ARTICLE_UPDATES_FILE.write({
+        'eventType': ArticleUpdate.DELETE.name,
+        'file_name': file_name
+    })
 
 
 def run_ttl_cleanup():
     """Delete articles with expired TTL from an index."""
     articles_to_delete = []
     for file_name, article_info in file_name_to_article.items():
-        time_diff = int((max_publication_time - article_info['publication_time']).total_seconds())
+        time_diff = max_publication_time - article_info['publication_time']
         if time_diff > article_info['ttl']:
             articles_to_delete.append(file_name)
     list(map(delete_article, articles_to_delete))
@@ -817,10 +870,7 @@ def extract_threads(article_info):
             min_time = min([article_info[a_id]['publication_time'] for a_id in article_ids])
             for a_id in article_ids:
                 a_time = article_info[a_id]['publication_time']
-                if (type(min_time) is not datetime) or (type(a_time) is not datetime):
-                    distances_time[a_id] = 1000
-                else:
-                    distances_time[a_id] = (a_time - min_time).total_seconds() // 60
+                distances_time[a_id] = (a_time - min_time) // 60
 
             # Filter out articles which are too far from the centroid.
             clean_articles = []
@@ -913,33 +963,133 @@ def sort_threads(article_threads):
     return result
 
 
-def save_to_disk():
-    """Save index contents to disk."""
-    index_info = {
-        'all_articles': all_articles,
-        'file_name_to_article': file_name_to_article,
-        'max_publication_time': max_publication_time,
-        'time_buckets': time_buckets
-    }
-    with open('index.pickle.tmp', 'wb') as f:
-        pickle.dump(index_info, f)
-    os.rename('index.pickle.tmp', 'index.pickle')
-
-
 def maybe_load_from_disk():
     """Load index contents from disk."""
     global all_articles, file_name_to_article, max_publication_time, time_buckets
-    
-    if not os.path.isfile('index.pickle'):
-        return
 
-    with open('index.pickle', 'rb') as f:
-        index_info = pickle.load(f)
+    # Create a set of deleted articles which will be ignored for index construction.    
+    deleted_articles = set()
+    if os.path.exists(ARTICLE_UPDATES_PATH):
+        with jsonlines.open(ARTICLE_UPDATES_PATH, 'r') as f:
+            for article_update in f:
+                if article_update['eventType'] == ArticleUpdate.DELETE.name:
+                    deleted_articles.add(article_update['file_name'])
+                elif article_update['eventType'] in {
+                ArticleUpdate.ADD.name, ArticleUpdate.IGNORE.name}:
+                    if article_update['file_name'] in deleted_articles:
+                        deleted_articles.remove(article_update['file_name'])
 
-    all_articles = index_info['all_articles']
-    file_name_to_article = index_info['file_name_to_article']
-    max_publication_time = index_info['max_publication_time']
-    time_buckets = index_info['time_buckets']
+    # Fetch index-related data.
+    max_publication_time_local = max_publication_time
+    all_articles_local = set()
+    file_name_to_article_local = {}
+    time_buckets_local = {}
+    clusters_local = {}
+    time_bucket_tfidf_info = defaultdict(lambda : {'row':[], 'col':[], 'data': []})
+    time_bucket_inverted_ix_info = defaultdict(lambda : {'row':[], 'col':[], 'data': []})
+    if os.path.exists(ARTICLE_UPDATES_PATH):
+        with jsonlines.open(ARTICLE_UPDATES_PATH, 'r') as f:
+            for article_update in f:
+                if article_update['file_name'] in deleted_articles:
+                    continue
+
+                all_articles_local.add(article_update['file_name'])
+
+                if article_update['eventType'] == ArticleUpdate.ADD.name:
+                    article_info = article_update['article_info']
+
+                    max_publication_time_local = max(
+                        article_info['publication_time'],
+                        max_publication_time_local)
+
+                    file_name_to_article_local[article_update['file_name']] = article_info
+
+                    # Fetch time bucket.
+                    tb_key = (article_info['time_bucket_id'], article_info['language'])
+                    if tb_key not in time_buckets_local:
+                        time_buckets_local[tb_key] = create_time_bucket(article_info['time_bucket_id'])
+
+                    # Update bucket clusters.
+                    local_cluster_id = (tb_key, article_info['cluster_id'])
+                    if local_cluster_id in clusters_local:
+                        current_cluster = clusters_local[local_cluster_id]
+                    else:
+                        current_cluster = {}
+                        current_cluster['id'] = article_info['cluster_id']
+                        current_cluster['article_ids'] = tuple()
+                        current_cluster['article_file_names'] = tuple()
+                        current_cluster['article_times'] = tuple()
+                        current_cluster['article_categories'] = tuple()
+                        clusters_local[local_cluster_id] = current_cluster
+
+                    current_cluster['article_ids'] += (article_info['index_row_id'],)
+                    current_cluster['article_file_names'] += (article_info['file_name'],)
+                    current_cluster['article_times'] += (article_info['publication_time'],)
+                    current_cluster['article_categories'] += (article_info['category'],)
+                    time_buckets_local[tb_key]['clusters'][article_info['index_row_id']] = current_cluster
+
+                    # Update time bucket max time.
+                    time_buckets_local[tb_key]['max_time'] = max(
+                        article_info['publication_time'],
+                        time_buckets_local[tb_key]['max_time'])
+
+                    # Save TF-IDF data.
+                    for col, data in zip(
+                        article_update['tfidf_indices'],
+                        article_update['tfidf_data']):
+                        time_bucket_tfidf_info[tb_key]['row'].append(article_info['index_row_id'])
+                        time_bucket_tfidf_info[tb_key]['col'].append(col)
+                        time_bucket_tfidf_info[tb_key]['data'].append(data)
+
+                    # Save inverted index data.
+                    for ix in article_update['term_ix']:
+                        time_bucket_inverted_ix_info[tb_key]['row'].append(ix)
+                        time_bucket_inverted_ix_info[tb_key]['col'].append(article_info['index_row_id'])
+                        time_bucket_inverted_ix_info[tb_key]['data'].append(article_info['index_row_id'])
+
+    # Create embedding matrix.    
+    for tb_key, tfidf_info in time_bucket_tfidf_info.items():
+        _, bucket_language = tb_key
+        vectorizer = vectorizer_sentpiece_en if bucket_language == LANG_EN else vectorizer_sentpiece_ru
+        mx = scipy.sparse.csr_matrix((tfidf_info['data'], (tfidf_info['row'], tfidf_info['col'])),
+            shape=(max(tfidf_info['row']) + 1, len(vectorizer.vocabulary_)))
+        time_buckets_local[tb_key]['mx'] = mx
+
+    # Create inverted index.
+    for tb_key, tfidf_info in time_bucket_inverted_ix_info.items():
+        _, bucket_language = tb_key
+        vectorizer = vectorizer_sentpiece_en if bucket_language == LANG_EN else vectorizer_sentpiece_ru
+        
+        mx = scipy.sparse.csr_matrix((tfidf_info['data'], (tfidf_info['row'], tfidf_info['col'])), 
+            shape=(len(vectorizer.vocabulary_), MAX_INDEX_SIZE)).tolil()
+        time_buckets_local[tb_key]['inverted_ix'] = mx
+
+    # Compute aggregate features for clusters.
+    for (tb_key, _), cluster_info in clusters_local.items():
+        cluster_info['max_time'] = max(cluster_info['article_times'])
+        cluster_info['category'] = Counter(
+            cluster_info['article_categories']).most_common(1)[0][0]
+
+        # Sort articles by relevance.
+        article_ids = cluster_info['article_ids'] 
+        article_file_names = cluster_info['article_file_names'] 
+        article_times = cluster_info['article_times'] 
+        article_categories = cluster_info['article_categories'] 
+
+        cluster_mx = time_buckets_local[tb_key]['mx'][article_ids, :]
+        relevance_scores = (cluster_mx * cluster_mx.T).sum(axis=0).A[0]
+        _, article_ids, article_file_names, article_times, article_categories = zip(*sorted(zip(
+            relevance_scores, article_ids, article_file_names, article_times, article_categories), key=lambda x: -x[0]))
+
+        cluster_info['article_ids'] = article_ids
+        cluster_info['article_file_names'] = article_file_names
+        cluster_info['article_times'] = article_times
+        cluster_info['article_categories'] = article_categories
+
+    all_articles = all_articles_local
+    file_name_to_article = file_name_to_article_local
+    max_publication_time = max_publication_time_local
+    time_buckets = time_buckets_local
 
 
 def get_response(command, source_dir):
@@ -977,6 +1127,30 @@ def get_response(command, source_dir):
         return top_threads
 
 
+time_diff_sum = 1e-6
+request_cnt = 1
+init_time = time.time()
+def timing_logger(prefix='Execution'):
+    """Function execution timing decorator."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            global time_diff_sum, request_cnt
+            start_time = int(time.time() * 1000)
+            func(*args, **kwargs)
+            end_time = int(time.time() * 1000)
+            time_diff = end_time - start_time
+            time_diff_sum += time_diff
+            request_cnt += 1
+            uptime_secs = int(time.time() - init_time) + 1
+            logger.info(f'{prefix} {args[0].path} (Size:{args[0].headers["Content-Length"]}) done in {time_diff} ms ({start_time} >> {end_time})'
+                        f' | Avg time: {int(time_diff_sum / request_cnt)} ms'
+                        f' | R/Sec: {request_cnt / uptime_secs:.2f}'
+                        f' | Rs: {request_cnt}'
+                        f' | Ix size: {len(file_name_to_article)}')
+        return wrapper
+    return decorator
+
+
 class RequestHandler(SimpleHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -989,6 +1163,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
             return False
         return True
 
+    @timing_logger('GET')
     def do_GET(self):
         """Process GET request for getting news threads.
 
@@ -1022,6 +1197,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(threads)
 
+    @timing_logger('PUT')
     def do_PUT(self):
         """Process PUT request with article content to be indexed.
 
@@ -1035,65 +1211,78 @@ class RequestHandler(SimpleHTTPRequestHandler):
         if not self.check_state():
             return
 
-        file_name = urlparse(self.path).path.replace('/', '')
-        article_exists = file_name in all_articles
+        with lock:
+            file_name = urlparse(self.path).path.replace('/', '')
+            article_exists = file_name in all_articles
 
-        ttl_str = self.headers['Cache-Control'] or f'={TTL_NO_EXPIRATION}'
-        ttl = max(min(int(ttl_str.split('=')[1]), TTL_MAX), TTL_MIN)
-        length = int(self.headers['Content-Length'])
-        article_content = self.rfile.read(length)
-        article_content = article_content.decode('utf-8', 'ignore')
-        article_info = process_html(article_content, file_name)
-        article_info['ttl'] = ttl
+            ttl_str = self.headers['Cache-Control'] or f'={TTL_NO_EXPIRATION}'
+            ttl = max(min(int(ttl_str.split('=')[1]), TTL_MAX), TTL_MIN)
+            length = int(self.headers['Content-Length'])
+            article_content = self.rfile.read(length)
+            article_content = article_content.decode('utf-8', 'ignore')[:MAX_CHARS]
+            article_info = process_html(article_content, file_name)
+            article_info['ttl'] = ttl
 
-        skip_article = False
-        if article_exists and (file_name in file_name_to_article):
-            skip_article = all(article_info[f] == file_name_to_article[file_name][f] for f in ARTICLE_MUTABLE_FIELDS)
+            file_name = article_info['original_title'] + '|' + file_name
+            article_info['file_name'] = file_name
 
-        if not skip_article:
-            # In case if article exists and was updated remove it from existing clusters.
+            skip_article = False
+            if article_exists and (file_name in file_name_to_article):
+                skip_article = all(article_info[f] == file_name_to_article[file_name][f] for f in ARTICLE_MUTABLE_FIELDS)
+
+            if not skip_article:
+                # In case if article exists and was updated remove it from existing clusters.
+                if article_exists:
+                    delete_article(file_name)
+
+                # Add to the list of all articles.
+                all_articles.add(file_name)
+
+                # Add EN and RU news to the index.
+                is_indexed = False
+                if article_info['language'] in LANGUAGES:
+                    article_info = classify_news([article_info])
+                    article_info = filter_news(article_info)
+
+                    if article_info:
+                        article_info = article_info[0]
+                        vectorizer = vectorizer_sentpiece_en if article_info['language'] == LANG_EN else vectorizer_sentpiece_ru
+                        index_article(file_name, article_info, vectorizer)
+                        is_indexed = True
+                if not is_indexed:
+                    ARTICLE_UPDATES_FILE.write({
+                        'eventType': ArticleUpdate.IGNORE.name,
+                        'file_name': file_name
+                    })
+
             if article_exists:
-                delete_article(file_name)
+                self.send_response(204)
+            else:
+                self.send_response(201)
+            self.send_header('Content-Length', 0)
+            self.end_headers()
 
-            # Add to the list of all articles.
-            all_articles.add(file_name)
-
-            # Add EN and RU news to the index.
-            if article_info['language'] in LANGUAGES:
-                article_info = classify_news([article_info])
-                article_info = filter_news(article_info)
-
-                if article_info:
-                    article_info = article_info[0]
-                    vectorizer = vectorizer_sentpiece_en if article_info['language'] == LANG_EN else vectorizer_sentpiece_ru
-                    index_article(file_name, article_info, vectorizer)
-
-        if article_exists:
-            self.send_response(204)
-        else:
-            self.send_response(201)
-        self.send_header('Content-Length', 0)
-        self.end_headers()
-
+    @timing_logger('DELETE')
     def do_DELETE(self):
-        """Process DELETE request with article to delete from the index.
+        """Process DELETE request with article to delete from index.
 
         DELETE /article.html HTTP/1.1
         """
         if not self.check_state():
             return
 
-        file_name = urlparse(self.path).path.replace('/', '')
-        article_exists = file_name in all_articles
+        with lock:
+            file_name = urlparse(self.path).path.replace('/', '')
+            article_exists = file_name in all_articles
 
-        if article_exists:
-            delete_article(file_name)
-            self.send_response(204)
-        else:
-            self.send_response(404)
-        
-        self.send_header('Content-Length', 0)
-        self.end_headers()
+            if article_exists:
+                delete_article(file_name)
+                self.send_response(204)
+            else:
+                self.send_response(404)
+            self.send_header('Content-Length', 0)
+            self.end_headers()
+
 
 
 if __name__ == '__main__':
@@ -1112,12 +1301,26 @@ if __name__ == '__main__':
                     raise Exception('Server port is not specified.')
                 CURRENT_SERVER_STATE = ServerState.LOADING
 
-                server = HTTPServer(('localhost', server_port), RequestHandler)
-                
-                server_thread = threading.Thread(target=server.serve_forever)
-                server_thread.start();
+                addr = ('localhost', server_port)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(addr)
+                sock.listen()
 
-                maybe_load_from_disk()
+                class Thread(threading.Thread):
+                    def __init__(self, i):
+                        threading.Thread.__init__(self)
+                        self.i = i
+                        self.daemon = True
+                        self.start()
+                    def run(self):
+                        httpd = HTTPServer(addr, RequestHandler, False)
+                        httpd.socket = sock
+                        httpd.server_bind = self.server_close = lambda self: None
+                        httpd.serve_forever()
+                [Thread(i) for i in range(HTTP_SERVER_THREAD_CNT)]
+
+                logger.info('Loading model files...')
 
             # Load language detection model.
             # https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
@@ -1183,6 +1386,14 @@ if __name__ == '__main__':
                         if '▁' + candidate_token == token:
                             boosted_token_ids.add(idx)
 
+                if args.command == 'server':
+                    logger.info('Initialising index...')
+                    t = time.time()
+                    maybe_load_from_disk()
+                    logger.info(f'Loaded {len(all_articles)} articles')
+                    logger.info(f'Index size: {len(file_name_to_article)}')
+                    logger.info(f'Index initialisation completed in {time.time() - t:.2f} sec')
+
                 CURRENT_SERVER_STATE = ServerState.READY
             else:
                 word2norm = {}
@@ -1192,6 +1403,8 @@ if __name__ == '__main__':
             if args.command != 'server':
                 result = get_response(args.command, Path(args.command_mod))
                 print(json.dumps(result, ensure_ascii=False))
+            else:
+                time.sleep(9e7)
 
     else:
         raise Exception('Unknown command, please use one of: languages, news, categories, threads, server.')
