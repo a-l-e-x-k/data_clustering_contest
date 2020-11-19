@@ -1222,9 +1222,6 @@ class RequestHandler(SimpleHTTPRequestHandler):
             article_info = process_html(article_content, file_name)
             article_info['ttl'] = ttl
 
-            file_name = article_info['original_title'] + '|' + file_name
-            article_info['file_name'] = file_name
-
             skip_article = False
             if article_exists and (file_name in file_name_to_article):
                 skip_article = all(article_info[f] == file_name_to_article[file_name][f] for f in ARTICLE_MUTABLE_FIELDS)
