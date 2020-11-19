@@ -241,7 +241,6 @@ def create_json_writer(file_path, mode='a', compact=True, sort_keys=True, flush=
     return jsonlines.Writer(open(file_path, mode), compact=compact, sort_keys=sort_keys, flush=flush)
 
 ARTICLE_UPDATES_PATH = 'article_updates.jsonl'
-CLUSTERS_PATH = 'clusters.jsonl'
 ARTICLE_UPDATES_FILE = create_json_writer(ARTICLE_UPDATES_PATH)
 
 # Article info fields which are saved to disk.
